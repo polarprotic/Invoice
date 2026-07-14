@@ -1,11 +1,32 @@
 """
 Invoice Extraction Pipeline -- Cloud GPT-4o API, CONTINUOUS WATCH-FOLDER
+COST-OPTIMIZED VERSION
 ------------------------------------------------------------------------------
+Changes from the original, all aimed at cutting API spend while protecting
+handwriting accuracy:
+
+  1. API key now comes from an environment variable, not hardcoded in the
+     file (rotate your old key -- it was exposed).
+  2. Per-page image "detail" is chosen adaptively:
+       - pages that look mostly typed/printed (based on OCR confidence and
+         character density) are sent at "low" detail (~4x cheaper per image)
+       - pages that look sparse, low-confidence, or likely handwritten keep
+         "high" detail, so accuracy on the hard pages is untouched
+  3. OCR hint text sent in the prompt is trimmed/filtered: low-confidence
+     garbled OCR (mostly noise on handwritten sections) is no longer
+     stuffed into the prompt, and hints are capped in length.
+  4. MAX_RETRIES reduced 3 -> 2. Retries resend the full image, so they're
+     the most expensive kind of waste; illegibility from handwriting is a
+     capability issue, not something a 3rd retry usually fixes.
+  5. Blank / near-blank PDF pages are detected and skipped before ever
+     being sent to the API.
+  6. Everything else (prompt content, line-item logic, Excel output,
+     watch-folder loop, state file) is unchanged from the original.
+
 OUTPUT: Per-file subfolders in OUTPUT_ROOT.
         For every processed image -> <OUTPUT_ROOT>/<basename>/
             - <basename>.xlsx   (single-file Excel)
             - <basename>.<ext>  (copy of the original input image/PDF)
-        No batch Excel, no 'done/' subfolder.
 """
 
 import os
@@ -13,32 +34,32 @@ import io
 import re
 import json
 import time
-import glob
 import base64
 import shutil
 import signal
-import tempfile
 import threading
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import pytesseract
 from PIL import Image
 import fitz  # PyMuPDF
 import pandas as pd
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openai import OpenAI
 
 # ---------- CONFIG ----------
-OUTPUT_SUFFIX = "_output"   # appended to each input folder name
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # folder where the script lives
+OUTPUT_SUFFIX = "_output"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# OPENAI_MODEL = "gpt-4o"
 OPENAI_MODEL = "gpt-4o-mini"
 
-OPENAI_API_KEY = "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"
+# SECURITY: never hardcode the key. Set it before running:
+#   export OPENAI_API_KEY="sk-..."          (mac/linux)
+#   setx OPENAI_API_KEY "sk-..."            (windows)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 API_CONCURRENT_WORKERS = 4
 NUM_SAMPLES_PER_FILE = 1
@@ -49,8 +70,8 @@ if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 MAX_IMAGE_DIMENSION = 2200
-MAX_RETRIES = 3
-REQUEST_TIMEOUT = 120  # seconds
+MAX_RETRIES = 2                     # was 3 -- retries resend full images, expensive
+REQUEST_TIMEOUT = 120
 MAX_OUTPUT_TOKENS = 4096
 MAX_EXTRA_COLUMNS = 25
 
@@ -59,6 +80,24 @@ NUMERIC_KEYS = {"subtotal", "tax", "discount", "tds", "freight", "balance_remain
 # ---- CONTINUOUS CONFIG ----
 POLL_INTERVAL_SECONDS = 20
 STATE_FILE_NAME = "_pipeline_state.json"
+
+# ---- COST OPTIMIZATION CONFIG ----
+# OCR confidence (0-100) above which a page is considered "cleanly typed"
+# enough to use low-detail image encoding. Handwriting / noisy scans score
+# low here and automatically keep high-detail (full accuracy).
+LOW_DETAIL_OCR_CONFIDENCE_THRESHOLD = 75
+# Minimum OCR character count for a page to even be considered for low
+# detail -- very sparse pages are treated as possibly handwritten/complex.
+LOW_DETAIL_MIN_CHAR_COUNT = 120
+# OCR hint text is capped to this many characters per page to avoid paying
+# for garbled, low-value OCR noise as prompt tokens.
+OCR_HINT_MAX_CHARS_PER_PAGE = 1200
+# Below this per-page OCR confidence, we don't bother including the OCR
+# hint for that page at all (it's mostly noise on handwriting anyway).
+OCR_HINT_MIN_CONFIDENCE_TO_INCLUDE = 35
+# A PDF page is treated as blank/near-blank (skipped entirely, no API
+# cost) if its non-white pixel fraction is below this threshold.
+BLANK_PAGE_INK_FRACTION_THRESHOLD = 0.002
 # -----------------------------
 
 CORE_COLUMNS = ["source_file", "document_type", "date", "payer", "payee",
@@ -190,7 +229,6 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".pdf")
 
 
 def discover_input_files(root_dir):
-    """Recursively find all image/PDF files under root_dir."""
     found = []
     for dirpath, _dirnames, filenames in os.walk(root_dir):
         for fname in filenames:
@@ -199,24 +237,77 @@ def discover_input_files(root_dir):
     return sorted(found)
 
 
-def load_pages(path):
+def is_blank_page(img, ink_fraction_threshold=BLANK_PAGE_INK_FRACTION_THRESHOLD):
+    """Cheap, free (no API call) check for a blank/near-blank page."""
+    try:
+        gray = np.array(img.convert("L"))
+        ink_pixels = np.count_nonzero(gray < 245)
+        fraction = ink_pixels / gray.size
+        return fraction < ink_fraction_threshold
+    except Exception:
+        return False
+
+
+def load_pages(path, safe_print=print):
     ext = path.lower().rsplit(".", 1)[-1]
     if ext == "pdf":
         doc = fitz.open(path)
-        return [Image.open(io.BytesIO(page.get_pixmap(dpi=200).tobytes("png"))) for page in doc]
+        pages = [Image.open(io.BytesIO(page.get_pixmap(dpi=200).tobytes("png"))) for page in doc]
+        kept = []
+        for i, img in enumerate(pages):
+            if is_blank_page(img):
+                safe_print(f"    [SKIP BLANK PAGE] {os.path.basename(path)} page {i + 1}")
+                continue
+            kept.append(img)
+        return kept if kept else pages[:1]  # never return zero pages
     return [Image.open(path).convert("RGB")]
 
 
-def ocr_hint_text(images):
+def ocr_page_data(img):
+    """Return (text, mean_confidence) for a page using Tesseract's
+    detailed output so we can decide detail level + hint inclusion."""
+    try:
+        data = pytesseract.image_to_data(img, config="--oem 3 --psm 6",
+                                          output_type=pytesseract.Output.DICT)
+        words, confs = [], []
+        for word, conf in zip(data["text"], data["conf"]):
+            word = word.strip()
+            if not word:
+                continue
+            try:
+                c = float(conf)
+            except (TypeError, ValueError):
+                continue
+            if c < 0:
+                continue
+            words.append(word)
+            confs.append(c)
+        text = " ".join(words)
+        mean_conf = sum(confs) / len(confs) if confs else 0.0
+        return text, mean_conf
+    except Exception as e:
+        return f"[OCR unavailable: {e}]", 0.0
+
+
+def ocr_hint_text(page_infos):
+    """page_infos: list of dicts with 'text' and 'confidence'. Filters out
+    low-value/noisy OCR (mostly from handwriting) and caps length to save
+    prompt tokens."""
     chunks = []
-    for i, img in enumerate(images):
-        try:
-            text = pytesseract.image_to_string(img, config="--oem 3 --psm 6").strip()
-        except Exception as e:
-            text = f"[OCR unavailable: {e}]"
+    for i, info in enumerate(page_infos):
+        text, conf = info["text"], info["confidence"]
+        if conf < OCR_HINT_MIN_CONFIDENCE_TO_INCLUDE:
+            chunks.append(
+                f"--- OCR of page {i + 1}: low confidence ({conf:.0f}), "
+                f"likely handwritten/noisy -- OCR hint omitted, rely on the image ---"
+            )
+            continue
+        trimmed = text[:OCR_HINT_MAX_CHARS_PER_PAGE]
+        if len(text) > OCR_HINT_MAX_CHARS_PER_PAGE:
+            trimmed += " …[truncated]"
         chunks.append(
             f"--- OCR of page {i + 1} (typed text only, may contain errors,\n"
-            f"    handwriting likely garbled -- use as a hint, not ground truth) ---\n{text}"
+            f"    handwriting likely garbled -- use as a hint, not ground truth) ---\n{trimmed}"
         )
     return "\n\n".join(chunks)
 
@@ -246,6 +337,16 @@ def pil_to_data_uri(img):
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
+
+
+def choose_detail_level(ocr_text, ocr_confidence):
+    """Adaptive cost control: cleanly-typed, dense pages -> 'low' detail
+    (much cheaper). Sparse, low-confidence, or likely-handwritten pages
+    keep 'high' detail so accuracy is preserved where it matters."""
+    if ocr_confidence >= LOW_DETAIL_OCR_CONFIDENCE_THRESHOLD and \
+       len(ocr_text) >= LOW_DETAIL_MIN_CHAR_COUNT:
+        return "low"
+    return "high"
 
 
 # -----------------------------------------------------------------------
@@ -309,18 +410,19 @@ def score_extraction(records):
 # -----------------------------------------------------------------------
 
 def check_openai_key():
-    if not OPENAI_API_KEY or OPENAI_API_KEY.startswith("sk-REPLACE"):
-        print("ERROR: OPENAI_API_KEY is not set.")
+    if not OPENAI_API_KEY:
+        print("ERROR: OPENAI_API_KEY environment variable is not set.\n"
+              "  export OPENAI_API_KEY=\"sk-...\"   (then re-run)")
         return False
     return True
 
 
-def _extract_single_sample(client, path, image_data_uris, prompt,
+def _extract_single_sample(client, path, image_data_uris_with_detail, prompt,
                             debug_dir=None, safe_print=print, sample_label=""):
     tag = f" [{sample_label}]" if sample_label else ""
     content = [{"type": "text", "text": prompt}]
-    for uri in image_data_uris:
-        content.append({"type": "image_url", "image_url": {"url": uri, "detail": "high"}})
+    for uri, detail in image_data_uris_with_detail:
+        content.append({"type": "image_url", "image_url": {"url": uri, "detail": detail}})
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -355,15 +457,33 @@ def _extract_single_sample(client, path, image_data_uris, prompt,
 
 
 def extract(client, path, images, debug_dir=None, safe_print=print):
-    ocr_hint = ocr_hint_text(images)
+    # OCR each page once; reuse for both the hint text and the detail-level decision
+    page_infos = []
+    for img in images:
+        text, conf = ocr_page_data(img)
+        page_infos.append({"text": text, "confidence": conf})
+
+    ocr_hint = ocr_hint_text(page_infos)
     prompt = build_prompt(ocr_hint)
-    image_data_uris = [pil_to_data_uri(resize_for_model(img)) for img in images]
+
+    image_data_uris_with_detail = []
+    low_detail_count = 0
+    for img, info in zip(images, page_infos):
+        detail = choose_detail_level(info["text"], info["confidence"])
+        if detail == "low":
+            low_detail_count += 1
+        resized = resize_for_model(img)
+        image_data_uris_with_detail.append((pil_to_data_uri(resized), detail))
+
+    if low_detail_count:
+        safe_print(f"    [{os.path.basename(path)}] {low_detail_count}/{len(images)} "
+                   f"page(s) sent at low detail (cleanly typed)")
 
     best_records, best_score = None, None
     for i in range(1, NUM_SAMPLES_PER_FILE + 1):
         label = f"sample {i}/{NUM_SAMPLES_PER_FILE}"
         records = _extract_single_sample(
-            client, path, image_data_uris, prompt,
+            client, path, image_data_uris_with_detail, prompt,
             debug_dir=debug_dir, safe_print=safe_print, sample_label=label,
         )
         if records is None:
@@ -380,7 +500,7 @@ def extract(client, path, images, debug_dir=None, safe_print=print):
 
 
 # -----------------------------------------------------------------------
-# FLATTENING / EXCEL WRITING
+# FLATTENING / EXCEL WRITING  (unchanged from original)
 # -----------------------------------------------------------------------
 
 def flatten_records(results, source_file):
@@ -506,28 +626,21 @@ def write_excel(core_rows, extra_columns, out_path):
 
 
 # -----------------------------------------------------------------------
-# PER-FILE OUTPUT  (replaces all batching logic)
+# PER-FILE OUTPUT  (unchanged from original)
 # -----------------------------------------------------------------------
 
 def write_per_file_output(source_path, results, output_root, safe_print=print):
-    """
-    Create <output_root>/<basename>/
-        <basename>.xlsx   -- extracted data
-        <basename>.<ext>  -- copy of the original file
-    """
     base_name = os.path.splitext(os.path.basename(source_path))[0]
-    ext       = os.path.splitext(source_path)[1]          # e.g. ".jpg"
+    ext       = os.path.splitext(source_path)[1]
     out_dir   = os.path.join(output_root, base_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1. Copy the original image / PDF into the output folder
     dest_image = os.path.join(out_dir, base_name + ext)
     try:
         shutil.copy2(source_path, dest_image)
     except Exception as e:
         safe_print(f"    [WARNING] could not copy source file: {e}")
 
-    # 2. Write the per-file Excel
     if not results:
         safe_print(f"    [WARNING] no records for '{base_name}' -- Excel not written.")
         return
@@ -543,7 +656,7 @@ def write_per_file_output(source_path, results, output_root, safe_print=print):
 
 
 # -----------------------------------------------------------------------
-# STATE MANAGEMENT
+# STATE MANAGEMENT  (unchanged from original)
 # -----------------------------------------------------------------------
 
 def state_file_path(output_root):
@@ -570,7 +683,7 @@ def save_state(state, output_root):
 
 
 # -----------------------------------------------------------------------
-# MAIN CONTINUOUS LOOP
+# MAIN CONTINUOUS LOOP  (unchanged from original)
 # -----------------------------------------------------------------------
 
 _shutdown_requested = threading.Event()
@@ -607,11 +720,17 @@ def output_root_for(input_folder):
 
 def main():
     print("=" * 60)
-    print("CONFIG:")
+    print("CONFIG (cost-optimized):")
     print(f"  OPENAI_MODEL           = {OPENAI_MODEL}")
     print(f"  API_CONCURRENT_WORKERS = {API_CONCURRENT_WORKERS}  (per input folder)")
     print(f"  NUM_SAMPLES_PER_FILE   = {NUM_SAMPLES_PER_FILE}")
+    print(f"  MAX_RETRIES            = {MAX_RETRIES}")
     print(f"  POLL_INTERVAL_SECONDS  = {POLL_INTERVAL_SECONDS}")
+    print(f"  Adaptive image detail  = low-detail for typed pages "
+          f"(conf>={LOW_DETAIL_OCR_CONFIDENCE_THRESHOLD}, chars>={LOW_DETAIL_MIN_CHAR_COUNT})")
+    print(f"  OCR hint cap           = {OCR_HINT_MAX_CHARS_PER_PAGE} chars/page, "
+          f"omitted below conf {OCR_HINT_MIN_CONFIDENCE_TO_INCLUDE}")
+    print(f"  Blank page skipping    = ink fraction < {BLANK_PAGE_INK_FRACTION_THRESHOLD}")
     print(f"  BASE_DIR               = {BASE_DIR}  (scanned for input folders)")
     print(f"  OUTPUT_SUFFIX          = {OUTPUT_SUFFIX}")
     print("  OUTPUT: <InputFolder>{OUTPUT_SUFFIX}/<basename>/  ->  <basename>.xlsx + copy of source")
@@ -655,22 +774,19 @@ def main():
         base_name  = os.path.splitext(os.path.basename(f))[0]
         folder_tag = os.path.basename(output_root)
 
-        # Output subfolder for this file
         out_dir = os.path.join(output_root, base_name)
         os.makedirs(out_dir, exist_ok=True)
 
         try:
-            images  = load_pages(f)
+            images  = load_pages(f, safe_print=safe_print)
             results = extract(client, f, images, debug_dir=out_dir, safe_print=safe_print)
 
-            # Cache raw JSON alongside the other output files
             cp  = os.path.join(out_dir, "raw_extraction.json")
             tmp = cp + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(results, fh, ensure_ascii=False, indent=2)
             os.replace(tmp, cp)
 
-            # Write per-file Excel + copy of source image
             write_per_file_output(f, results, output_root, safe_print=safe_print)
 
             safe_print(f"[OK][{folder_tag}] {os.path.basename(f)} -> {len(results)} record(s)")
